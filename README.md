@@ -1,5 +1,8 @@
 # Artefact Mirror: A Declarative Mirroring Tool for Container Images & Helm Charts
 
+[![Mirror Container Images](https://github.com/scalevector-io/artefact-mirror/actions/workflows/mirror-images.yaml/badge.svg)](https://github.com/scalevector-io/artefact-mirror/actions/workflows/mirror-images.yaml)
+[![Mirror Helm Charts](https://github.com/scalevector-io/artefact-mirror/actions/workflows/mirror-charts.yaml/badge.svg)](https://github.com/scalevector-io/artefact-mirror/actions/workflows/mirror-charts.yaml)
+
 A simple, fast, and declarative utility for mirroring public container images and Helm charts to GitHub Container Registry using a GitHub Actions matrix strategy.
 
 ## Overview
