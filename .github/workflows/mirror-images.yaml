@@ -1,0 +1,237 @@
+name: Mirror Container Images
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Optional: Specific image to mirror (e.g., nginx). Leave blank to mirror all.'
+        required: false
+        default: ''
+  # Runs on a schedule (e.g., every Monday at 3:00 AM UTC)
+  schedule:
+    - cron: '0 3 * * 1'
+
+  # New trigger: Runs on push to the main branch ONLY if the images.yaml file changed
+  push:
+    branches:
+      - main
+    paths:
+      - 'configs/images.yaml'
+
+jobs:
+  prepare-matrix:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate_matrix.outputs.json_matrix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq and jq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Generate matrix from YAML
+        id: generate_matrix
+        env:
+          TARGET_IMAGE: ${{ github.event.inputs.image_name || '' }}
+        run: |
+          if [ -z "$TARGET_IMAGE" ]; then
+            # No specific image targeted, include all images
+            matrix=$(yq -o=json '[
+              .images[]
+              | . as $img
+              | $img.versions[] as $v
+              | {
+                  "name": $img.name,
+                  "source_registry": $img.source_registry,
+                  "version": $v,
+                  "platforms": ($img.platforms // ["linux/amd64", "linux/arm64"])
+                }
+            ]' ./configs/images.yaml | jq -c .)
+          else
+            # Specific image targeted
+            matrix=$(yq -o=json --arg target "$TARGET_IMAGE" '[
+              .images[]
+              | select(.name == $target)
+              | . as $img
+              | $img.versions[] as $v
+              | {
+                  "name": $img.name,
+                  "source_registry": $img.source_registry,
+                  "version": $v,
+                  "platforms": ($img.platforms // ["linux/amd64", "linux/arm64"])
+                }
+            ]' ./configs/images.yaml | jq -c .)
+          fi
+          
+          # Write to GITHUB_OUTPUT using heredoc to handle special characters
+          {
+            echo "json_matrix<<EOF"
+            echo "$matrix"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "Generated matrix: $matrix"
+
+  mirror:
+    name: Mirror ${{ matrix.image.name }}:${{ matrix.image.version }}
+    needs: prepare-matrix
+    # Only run the job if the matrix is not empty
+    if: needs.prepare-matrix.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Define Image Names
+        id: image_names
+        run: |
+          SOURCE_IMAGE="${{ matrix.image.source_registry }}/${{ matrix.image.name }}:${{ matrix.image.version }}"
+          DESTINATION_IMAGE="ghcr.io/scalevector-io/${{ matrix.image.name }}:${{ matrix.image.version }}"
+          
+          echo "source_image=${SOURCE_IMAGE}" >> $GITHUB_OUTPUT
+          echo "destination_image=${DESTINATION_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Create Multi-Platform Manifest
+        run: |
+          SOURCE_IMAGE="${{ steps.image_names.outputs.source_image }}"
+          DESTINATION_IMAGE="${{ steps.image_names.outputs.destination_image }}"
+          
+          echo "--> Creating multi-platform manifest for ${DESTINATION_IMAGE}"
+          echo "    Source: ${SOURCE_IMAGE}"
+          echo "    Platforms: ${{ join(matrix.image.platforms, ', ') }}"
+          
+          # Build source references for each platform
+          SOURCE_REFS=""
+          for platform in ${{ join(matrix.image.platforms, ' ') }}; do
+            if [ -n "$SOURCE_REFS" ]; then
+              SOURCE_REFS="$SOURCE_REFS "
+            fi
+            SOURCE_REFS="${SOURCE_REFS}${SOURCE_IMAGE}"
+          done
+          
+          # Use buildx imagetools to create multi-platform manifest
+          docker buildx imagetools create \
+            --tag ${DESTINATION_IMAGE} \
+            ${SOURCE_IMAGE}
+          
+          echo "--> Successfully created multi-platform image: ${DESTINATION_IMAGE}"
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image_names.outputs.destination_image }}
+          format: 'table'
+          exit-code: '0' # Don't fail the job on vulnerabilities
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Generate vulnerability summary
+        if: always()
+        run: |
+          IMAGE_NAME="${{ matrix.image.name }}:${{ matrix.image.version }}"
+          echo "## 🔍 Security Scan Results for ${IMAGE_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Note: Detailed scan results are available in the previous step logs and artifacts
+          echo "📋 **Security scan completed for ${IMAGE_NAME}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📁 **Where to find results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Console logs**: Check the 'Scan image for vulnerabilities' step above" >> $GITHUB_STEP_SUMMARY
+          echo "- **Detailed reports**: Download artifacts from this workflow run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Generate additional vulnerability reports
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ steps.image_names.outputs.destination_image }}
+          format: 'json'
+          output: 'trivy-report.json'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Create formatted vulnerability report
+        if: always()
+        id: artifact_name
+        run: |
+          # Create a detailed vulnerability report
+          IMAGE_NAME="${{ matrix.image.name }}:${{ matrix.image.version }}"
+          REPORT_FILE="vulnerability-report-$(echo "${{ matrix.image.name }}-${{ matrix.image.version }}" | sed 's/[\/:<>|*?"\\[:cntrl:]]/-/g').txt"
+          
+          echo "# Vulnerability Report for ${IMAGE_NAME}" > ${REPORT_FILE}
+          echo "Generated: $(date -u)" >> ${REPORT_FILE}
+          echo "Mirror URL: ghcr.io/scalevector-io/${{ matrix.image.name }}:${{ matrix.image.version }}" >> ${REPORT_FILE}
+          echo "" >> ${REPORT_FILE}
+          
+          # Parse JSON report and create summary
+          if [ -f "trivy-report.json" ]; then
+            # Count vulnerabilities by severity using jq
+            CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-report.json 2>/dev/null || echo "0")
+            HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-report.json 2>/dev/null || echo "0")
+            MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-report.json 2>/dev/null || echo "0")
+            
+            # Ensure counts are valid numbers
+            CRITICAL_COUNT=${CRITICAL_COUNT:-0}
+            HIGH_COUNT=${HIGH_COUNT:-0}
+            MEDIUM_COUNT=${MEDIUM_COUNT:-0}
+            
+            echo "VULNERABILITY SUMMARY:" >> ${REPORT_FILE}
+            echo "Critical: ${CRITICAL_COUNT}" >> ${REPORT_FILE}
+            echo "High: ${HIGH_COUNT}" >> ${REPORT_FILE}
+            echo "Medium: ${MEDIUM_COUNT}" >> ${REPORT_FILE}
+            echo "" >> ${REPORT_FILE}
+            
+            # Add GitHub annotations for significant vulnerabilities
+            if [ "${CRITICAL_COUNT}" -gt 0 ] 2>/dev/null; then
+              echo "::warning title=Security Alert::${IMAGE_NAME} contains ${CRITICAL_COUNT} CRITICAL vulnerabilities"
+            fi
+            
+            if [ "${HIGH_COUNT}" -gt 0 ] 2>/dev/null; then
+              echo "::warning title=Security Alert::${IMAGE_NAME} contains ${HIGH_COUNT} HIGH vulnerabilities"
+            fi
+            
+            echo "See trivy-report.json for detailed vulnerability information." >> ${REPORT_FILE}
+          else
+            echo "Trivy scan output not available." >> ${REPORT_FILE}
+          fi
+          
+          # Set output for artifact upload
+          SANITIZED_NAME=$(echo "vulnerability-report-${{ matrix.image.name }}-${{ matrix.image.version }}" | sed 's/[\/:<>|*?"\\[:cntrl:]]/-/g')
+          echo "sanitized_name=$SANITIZED_NAME" >> $GITHUB_OUTPUT
+          echo "report_file=$REPORT_FILE" >> $GITHUB_OUTPUT
+
+      - name: Upload vulnerability reports as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.artifact_name.outputs.sanitized_name }}
+          path: |
+            ${{ steps.artifact_name.outputs.report_file }}
+            trivy-report.json
+          retention-days: 30

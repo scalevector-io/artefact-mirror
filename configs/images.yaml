@@ -1,0 +1,15 @@
+images:
+  - name: 'hashicorp/vault'
+    versions: [1.19.0, 1.19.5]
+    source_registry: 'docker.io'
+    platforms: ["linux/amd64", "linux/arm64"]
+
+  - name: 'hashicorp/vault-k8s'
+    versions: [1.6.2, 1.7.0]
+    source_registry: 'docker.io'
+    platforms: ["linux/amd64", "linux/arm64"]
+    
+  - name: 'hashicorp/vault-csi-provider'
+    versions: [1.5.0]
+    source_registry: 'docker.io'
+    platforms: ["linux/amd64", "linux/arm64"]

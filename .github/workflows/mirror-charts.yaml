@@ -1,0 +1,126 @@
+name: Mirror Helm Charts
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      chart_name:
+        description: 'Optional: Specific chart to mirror (e.g., vault). Leave blank to mirror all.'
+        required: false
+        default: ''
+  # Runs on a schedule (e.g., every Monday at 4:00 AM UTC)
+  schedule:
+    - cron: '0 4 * * 1'
+
+  # New trigger: Runs on push to the main branch ONLY if the charts.yaml file changed
+  push:
+    branches:
+      - main
+    paths:
+      - 'configs/charts.yaml'
+
+jobs:
+  prepare-matrix:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate_matrix.outputs.json_matrix }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq and jq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Generate matrix from YAML
+        id: generate_matrix
+        env:
+          TARGET_CHART: ${{ github.event.inputs.chart_name || '' }}
+        run: |
+          if [ -z "$TARGET_CHART" ]; then
+            # No specific chart targeted, include all charts
+            matrix=$(yq -o=json '[
+              .charts[]
+              | .versions[] as $v
+              | {
+                  "name": .name,
+                  "repo_name": .repo_name,
+                  "repo_url": .repo_url,
+                  "version": $v
+                }
+            ]' ./configs/charts.yaml | jq -c .)
+          else
+            # Specific chart targeted
+            matrix=$(yq -o=json --arg target "$TARGET_CHART" '[
+              .charts[]
+              | select(.name == $target)
+              | .versions[] as $v
+              | {
+                  "name": .name,
+                  "repo_name": .repo_name,
+                  "repo_url": .repo_url,
+                  "version": $v
+                }
+            ]' ./configs/charts.yaml | jq -c .)
+          fi
+          
+          # Write to GITHUB_OUTPUT using heredoc to handle special characters
+          {
+            echo "json_matrix<<EOF"
+            echo "$matrix"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "Generated matrix: $matrix"
+
+  mirror:
+    name: Mirror ${{ matrix.chart.name }}:${{ matrix.chart.version }}
+    needs: prepare-matrix
+    # Only run the job if the matrix is not empty
+    if: needs.prepare-matrix.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chart: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Log in to GitHub Container Registry (for OCI)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror Helm Chart
+        run: |
+          CHART_NAME="${{ matrix.chart.name }}"
+          CHART_VERSION="${{ matrix.chart.version }}"
+          REPO_NAME="${{ matrix.chart.repo_name }}"
+          REPO_URL="${{ matrix.chart.repo_url }}"
+          
+          # Construct the nested destination URL for better organization
+          DESTINATION_URL="oci://ghcr.io/scalevector-io/${REPO_NAME}"
+
+          echo "--> Mirroring Helm chart ${CHART_NAME}:${CHART_VERSION} to ${DESTINATION_URL}"
+          
+          # Add the public Helm repo, pull the chart, and push to your OCI registry
+          helm repo add ${REPO_NAME} ${REPO_URL}
+          helm repo update
+          helm pull ${REPO_NAME}/${CHART_NAME} --version ${CHART_VERSION}
+          helm push ${CHART_NAME}-${CHART_VERSION}.tgz ${DESTINATION_URL}
+
+          echo "--> Mirror successful for ${CHART_NAME}:${CHART_VERSION}"

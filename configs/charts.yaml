@@ -1,0 +1,5 @@
+charts:
+  - name: 'vault'
+    versions: ['0.29.0', '0.29.1', '0.30.0']
+    repo_name: 'hashicorp'
+    repo_url: 'https://helm.releases.hashicorp.com'
