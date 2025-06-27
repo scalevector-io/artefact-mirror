@@ -4,19 +4,20 @@
 
 1. [Architecture Overview](#architecture-overview)
 2. [System Components](#system-components)
-3. [Configuration Schema](#configuration-schema)
-4. [Workflow Implementation](#workflow-implementation)
-5. [Security Implementation](#security-implementation)
-6. [Advanced Configuration](#advanced-configuration)
-7. [Troubleshooting](#troubleshooting)
-8. [Performance Considerations](#performance-considerations)
-9. [API Reference](#api-reference)
+3. [Workflow Dependencies](#workflow-dependencies)
+4. [Configuration Schema](#configuration-schema)
+5. [Workflow Implementation](#workflow-implementation)
+6. [Security Implementation](#security-implementation)
+7. [Advanced Configuration](#advanced-configuration)
+8. [Troubleshooting](#troubleshooting)
+9. [Performance Considerations](#performance-considerations)
+10. [API Reference](#api-reference)
 
 ## Architecture Overview
 
 ### High-Level Architecture
 
-Artefact Mirror is a declarative, event-driven mirroring system built on GitHub Actions that provides automated, parallel mirroring of container images and Helm charts to GitHub Container Registry (GHCR).
+Artefact Mirror is a declarative, event-driven mirroring system built on GitHub Actions that provides automated, parallel mirroring of container images and Helm charts to GitHub Container Registry (GHCR). The system implements a **dependency-based architecture** with configuration validation as a prerequisite for mirroring operations.
 
 ```mermaid
 graph TB
@@ -25,10 +26,17 @@ graph TB
         CC[charts.yaml]
     end
     
+    subgraph "Validation Layer"
+        VW[Validate Configuration Workflow]
+        VS[YAML Syntax Validation]
+        SC[Schema Validation]
+        MG[Matrix Generation Test]
+    end
+    
     subgraph "Trigger Layer"
         SCH[Schedule Triggers]
         MAN[Manual Triggers]
-        PUSH[Push Triggers]
+        CFG[Config Change Triggers]
     end
     
     subgraph "Processing Layer"
@@ -48,11 +56,19 @@ graph TB
         ARTIFACTS[Workflow Artifacts]
     end
     
-    IC --> PM
-    CC --> PM
+    IC --> VW
+    CC --> VW
+    CFG --> VW
+    
+    VW --> VS
+    VW --> SC
+    VW --> MG
+    
+    VW -->|Success| PM
+    VW -->|Failure| SKIP[Skip Mirror Operations]
+    
     SCH --> PM
     MAN --> PM
-    PUSH --> PM
     
     PM --> YQ
     YQ --> JQ
@@ -63,20 +79,36 @@ graph TB
     MI --> GHCR
     MC --> GHCR
     SCAN --> ARTIFACTS
+    
+    style VW fill:#f3e5f5
+    style SKIP fill:#ffebee
 ```
 
 ### Core Design Principles
 
 1. **Declarative Configuration**: All artifacts defined in YAML configuration files
-2. **Matrix Strategy**: Parallel execution using GitHub Actions matrix strategy
-3. **Fail-Safe Operations**: Individual job failures don't halt entire workflow
-4. **Security-First**: Automatic vulnerability scanning with Trivy
-5. **Multi-Platform Support**: Native support for multiple CPU architectures
-6. **Event-Driven**: Responsive to configuration changes and scheduled execution
+2. **Validation-First**: Configuration validation required before mirroring operations
+3. **Matrix Strategy**: Parallel execution using GitHub Actions matrix strategy
+4. **Fail-Safe Operations**: Individual job failures don't halt entire workflow
+5. **Security-First**: Automatic vulnerability scanning with Trivy
+6. **Multi-Platform Support**: Native support for multiple CPU architectures
+7. **Event-Driven**: Responsive to configuration changes and scheduled execution
+8. **Dependency Management**: Clear workflow dependencies with bypass options for manual execution
 
 ## System Components
 
-### 1. Configuration Management
+### 1. Validation Layer
+
+The validation layer ensures configuration correctness before any mirroring operations:
+
+#### `validate-config.yaml`
+- **Purpose**: Validates YAML syntax and schema for all configuration files
+- **Trigger Sources**: Pull requests, pushes to main with config changes
+- **Validation Steps**: 
+  - YAML syntax validation using `yamllint`
+  - Schema validation for required fields and data types
+  - Matrix generation testing
+  - Comprehensive validation summary
 
 The system uses two primary configuration files:
 
@@ -86,27 +118,129 @@ Defines container images to be mirrored with their versions and platform require
 #### `configs/charts.yaml`
 Defines Helm charts to be mirrored with their repository information and versions.
 
-### 2. Workflow Orchestration
+### 3. Workflow Orchestration
 
-Two main GitHub Actions workflows:
+Three main GitHub Actions workflows with dependency relationships:
 
 #### `mirror-images.yaml`
 - **Purpose**: Mirrors container images
-- **Trigger Sources**: Schedule, manual dispatch, configuration changes
+- **Trigger Sources**: Schedule, manual dispatch, validation workflow success
+- **Dependencies**: Runs after successful validation (when triggered by config changes)
 - **Matrix Generation**: Dynamic creation of parallel jobs
 - **Security Integration**: Trivy vulnerability scanning
 
 #### `mirror-charts.yaml`
 - **Purpose**: Mirrors Helm charts as OCI artifacts
-- **Trigger Sources**: Schedule, manual dispatch, configuration changes
+- **Trigger Sources**: Schedule, manual dispatch, validation workflow success
+- **Dependencies**: Runs after successful validation (when triggered by config changes)
 - **OCI Integration**: Pushes charts to GHCR as OCI artifacts
 
-### 3. Security Layer
+### 4. Security Layer
 
 - **Vulnerability Scanning**: Trivy integration for all mirrored images
 - **Non-Blocking Security**: Vulnerabilities don't prevent mirroring
 - **Multi-Format Reports**: Console, JSON, and artifact outputs
 - **Severity Classification**: Critical, High, and Medium vulnerability tracking
+
+## Workflow Dependencies
+
+### Dependency Architecture
+
+The system implements a **validation-first** architecture where configuration validation is a prerequisite for mirroring operations when triggered by configuration changes:
+
+```mermaid
+graph LR
+    subgraph "Configuration-Driven Flow"
+        A[Config Change] --> B[Validate Configuration]
+        B -->|Success| C[Mirror Images]
+        B -->|Success| D[Mirror Charts]
+        B -->|Failure| E[Skip Mirroring]
+    end
+    
+    subgraph "Independent Flows"
+        F[Schedule] --> C
+        F --> D
+        G[Manual Trigger] --> C
+        G --> D
+    end
+    
+    style B fill:#f3e5f5
+    style E fill:#ffebee
+```
+
+### Trigger Mechanisms
+
+| Trigger Type | Validation Required | Workflow Dependency | Use Case |
+|-------------|-------------------|-------------------|----------|
+| **Configuration Change** | ✅ Yes | Dependent on validation success | Automatic deployment after config updates |
+| **Scheduled Execution** | ❌ No | Independent execution | Regular mirror maintenance |
+| **Manual Dispatch** | ❌ No | Independent execution | On-demand mirroring or troubleshooting |
+
+### Workflow Execution Logic
+
+#### Configuration-Driven Execution
+
+1. **Trigger**: Push to main branch with changes to `configs/*.yaml`
+2. **Validation**: `validate-config.yaml` workflow executes
+3. **Decision Point**: 
+   - **Success** → `mirror-images.yaml` and `mirror-charts.yaml` execute automatically
+   - **Failure** → Mirror workflows are skipped with clear logging
+
+#### Independent Execution
+
+- **Scheduled runs**: Execute on cron schedule without validation dependency
+- **Manual runs**: Execute immediately when triggered manually
+- **Bypass logic**: Skip validation checks for non-configuration-driven triggers
+
+### Implementation Details
+
+#### Workflow Dependencies (workflow_run)
+
+```yaml
+# Example from mirror-images.yaml
+on:
+  workflow_run:
+    workflows: ["Validate Configuration"]
+    types:
+      - completed
+    branches:
+      - main
+```
+
+#### Conditional Logic
+
+```yaml
+# Validation check job
+check-validation:
+  if: github.event_name == 'workflow_run'
+  steps:
+    - name: Check validation workflow result
+      run: |
+        if [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
+          echo "should_proceed=true" >> $GITHUB_OUTPUT
+        else
+          echo "should_proceed=false" >> $GITHUB_OUTPUT
+        fi
+```
+
+#### Matrix Preparation Logic
+
+```yaml
+# Matrix preparation with dependency awareness
+prepare-matrix:
+  needs: check-validation
+  if: always() && (github.event_name != 'workflow_run' || needs.check-validation.outputs.should_proceed == 'true')
+```
+
+### Benefits of This Architecture
+
+| Benefit | Description | Impact |
+|---------|-------------|--------|
+| **Safety** | Invalid configurations can't trigger mirror operations | Prevents failed deployments |
+| **Efficiency** | Only validated configurations proceed to mirroring | Reduces wasted compute resources |
+| **Flexibility** | Manual/scheduled runs bypass validation for operational needs | Maintains operational flexibility |
+| **Clarity** | Clear feedback when validation fails | Improves debugging experience |
+| **Reliability** | Consistent validation before automated operations | Increases system reliability |
 
 ## Configuration Schema
 
@@ -366,27 +500,54 @@ schedule:
 
 ### Common Issues and Solutions
 
-#### 1. Matrix Generation Failures
+#### 1. Workflow Dependency Issues
+
+**Symptom**: Mirror workflows don't run after configuration changes
+**Causes**:
+- Validation workflow failed
+- Workflow dependencies not properly configured
+- Event trigger mismatch
+
+**Diagnosis**:
+```bash
+# Check validation workflow status
+gh run list --workflow=validate-config.yaml
+
+# Check workflow dependencies in mirror workflows
+grep -A 5 "workflow_run:" /.github/workflows/mirror-*.yaml
+```
+
+**Resolution**:
+- Review validation workflow logs for errors
+- Ensure configuration files pass validation
+- Verify workflow_run triggers are correctly configured
+
+#### 2. Matrix Generation Failures
 
 **Symptom**: Workflow fails at matrix preparation
 **Causes**:
 - Invalid YAML syntax
 - Missing required fields
 - Empty configuration arrays
+- Validation workflow dependency issues
 
 **Diagnosis**:
 ```bash
 # Test YAML syntax locally
 yq eval '.images[]' configs/images.yaml
 yq eval '.charts[]' configs/charts.yaml
+
+# Check if validation workflow ran successfully
+gh run list --workflow=validate-config.yaml --limit=1
 ```
 
 **Resolution**:
+- Run validation workflow first if needed
 - Validate YAML syntax
 - Ensure all required fields are present
 - Check for empty arrays
 
-#### 2. Authentication Failures
+#### 3. Authentication Failures
 
 **Symptom**: Docker login failures during mirroring
 **Causes**:
@@ -407,7 +568,7 @@ permissions:
 - Check organization package settings
 - Confirm GITHUB_TOKEN scope
 
-#### 3. Multi-Platform Build Failures
+#### 4. Multi-Platform Build Failures
 
 **Symptom**: Platform-specific build errors
 **Causes**:
@@ -426,7 +587,7 @@ docker buildx imagetools inspect <source-image>
 - Adjust platform list in configuration
 - Use platform-specific tags if needed
 
-#### 4. Vulnerability Scan Timeouts
+#### 5. Vulnerability Scan Timeouts
 
 **Symptom**: Trivy scans fail or timeout
 **Causes**:
@@ -447,6 +608,18 @@ Add to workflow environment:
 env:
   ACTIONS_STEP_DEBUG: true
   ACTIONS_RUNNER_DEBUG: true
+```
+
+#### Workflow Dependency Debugging
+```bash
+# Check workflow run relationships
+gh run list --json workflowName,conclusion,createdAt
+
+# Inspect workflow dependency configuration
+yq eval '.on.workflow_run' .github/workflows/mirror-*.yaml
+
+# Check validation workflow outputs
+gh run view <run-id> --log
 ```
 
 #### Matrix Inspection
@@ -578,4 +751,4 @@ strategy:
 
 ### License and Compliance
 
-This technical documentation is subject to the same MIT License as the project. All mirrored artifacts retain their original licenses and compliance requirements. 
+This technical documentation is subject to the same Apache License 2.0 as the project. All mirrored artifacts retain their original licenses and compliance requirements. 

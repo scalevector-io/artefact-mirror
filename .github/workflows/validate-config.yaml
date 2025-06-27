@@ -1,0 +1,205 @@
+name: Validate Configuration
+
+on:
+  pull_request:
+    paths:
+      - 'configs/*.yaml'
+      - '.github/workflows/mirror-*.yaml'
+      - '.github/workflows/validate-config.yaml'
+      - '.github/workflows/generate-matrix.yml'
+      - '.github/actions/setup-tools/action.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'configs/*.yaml'
+      - '.github/workflows/mirror-*.yaml'
+
+jobs:
+  validate-yaml:
+    name: Validate YAML Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/setup-tools
+
+      - name: Install yamllint
+        run: |
+          sudo apt-get update && sudo apt-get install -y yamllint
+
+      - name: Validate YAML syntax
+        run: |
+          echo "🔍 Validating YAML syntax..."
+          yamllint configs/images.yaml
+          yamllint configs/charts.yaml
+          echo "✅ YAML syntax validation passed"
+
+      - name: Validate images.yaml schema
+        run: |
+          echo "🔍 Validating images.yaml schema..."
+          
+          # Check that images.yaml has required structure
+          if ! yq eval '.images' configs/images.yaml > /dev/null 2>&1; then
+            echo "❌ images.yaml must have 'images' root key"
+            exit 1
+          fi
+          
+                     # Validate each image entry
+           image_count=$(yq eval '.images | length' configs/images.yaml)
+           for ((i=0; i<image_count; i++)); do
+             current_idx=$((i + 1))
+             
+             # Check required fields
+             if ! yq eval ".images[$i].name" configs/images.yaml > /dev/null 2>&1; then
+               echo "❌ Image entry #$current_idx missing 'name' field"
+               exit 1
+             fi
+             if ! yq eval ".images[$i].versions" configs/images.yaml > /dev/null 2>&1; then
+               echo "❌ Image entry #$current_idx missing 'versions' field"
+               exit 1
+             fi
+             if ! yq eval ".images[$i].source_registry" configs/images.yaml > /dev/null 2>&1; then
+               echo "❌ Image entry #$current_idx missing 'source_registry' field"
+               exit 1
+             fi
+             
+             # Validate versions is an array
+             if ! yq eval ".images[$i].versions | type" configs/images.yaml | grep -qE "(!!seq|array)"; then
+               echo "❌ Image entry #$current_idx 'versions' field must be an array"
+               exit 1
+             fi
+             
+             # Validate platforms is an array (if present)
+             if yq eval ".images[$i] | has(\"platforms\")" configs/images.yaml | grep -q "true"; then
+               if ! yq eval ".images[$i].platforms | type" configs/images.yaml | grep -qE "(!!seq|array)"; then
+                 echo "❌ Image entry #$current_idx 'platforms' field must be an array"
+                 exit 1
+               fi
+             fi
+           done
+          
+          echo "✅ images.yaml schema validation passed"
+
+      - name: Validate charts.yaml schema
+        run: |
+          echo "🔍 Validating charts.yaml schema..."
+          
+          # Check that charts.yaml has required structure
+          if ! yq eval '.charts' configs/charts.yaml > /dev/null 2>&1; then
+            echo "❌ charts.yaml must have 'charts' root key"
+            exit 1
+          fi
+          
+                     # Validate each chart entry
+           chart_count=$(yq eval '.charts | length' configs/charts.yaml)
+           for ((i=0; i<chart_count; i++)); do
+             current_idx=$((i + 1))
+             
+             # Check required fields
+             if ! yq eval ".charts[$i].name" configs/charts.yaml > /dev/null 2>&1; then
+               echo "❌ Chart entry #$current_idx missing 'name' field"
+               exit 1
+             fi
+             if ! yq eval ".charts[$i].versions" configs/charts.yaml > /dev/null 2>&1; then
+               echo "❌ Chart entry #$current_idx missing 'versions' field"
+               exit 1
+             fi
+             if ! yq eval ".charts[$i].repo_name" configs/charts.yaml > /dev/null 2>&1; then
+               echo "❌ Chart entry #$current_idx missing 'repo_name' field"
+               exit 1
+             fi
+             if ! yq eval ".charts[$i].repo_url" configs/charts.yaml > /dev/null 2>&1; then
+               echo "❌ Chart entry #$current_idx missing 'repo_url' field"
+               exit 1
+             fi
+             
+             # Validate versions is an array
+             if ! yq eval ".charts[$i].versions | type" configs/charts.yaml | grep -qE "(!!seq|array)"; then
+               echo "❌ Chart entry #$current_idx 'versions' field must be an array"
+               exit 1
+             fi
+             
+             # Validate repo_url format
+             repo_url=$(yq eval ".charts[$i].repo_url" configs/charts.yaml)
+             if ! echo "$repo_url" | grep -E '^https?://'; then
+               echo "❌ Chart entry #$current_idx 'repo_url' must be a valid HTTP/HTTPS URL"
+               exit 1
+             fi
+           done
+          
+          echo "✅ charts.yaml schema validation passed"
+
+  test-matrix-generation:
+    name: Test Matrix Generation
+    needs: validate-yaml
+    strategy:
+      matrix:
+        config-type: ['images', 'charts']
+        include:
+          - config-type: 'images'
+            config-file: './configs/images.yaml'
+          - config-type: 'charts'
+            config-file: './configs/charts.yaml'
+    uses: ./.github/workflows/generate-matrix.yml
+    with:
+      config-type: ${{ matrix.config-type }}
+      config-file: ${{ matrix.config-file }}
+      target-filter: ''
+
+  validation-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [validate-yaml, test-matrix-generation]
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/setup-tools
+
+      - name: Generate validation summary
+        run: |
+          echo "## 📊 Configuration Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count total artifacts
+          image_count=$(yq eval '.images | length' configs/images.yaml)
+          chart_count=$(yq eval '.charts | length' configs/charts.yaml)
+          
+          # Count total versions
+          image_versions=$(yq eval '[.images[].versions[]] | length' configs/images.yaml)
+          chart_versions=$(yq eval '[.charts[].versions[]] | length' configs/charts.yaml)
+          
+          echo "### 📦 Configuration Overview" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Images**: $image_count artifacts, $image_versions versions" >> $GITHUB_STEP_SUMMARY
+          echo "- **Helm Charts**: $chart_count artifacts, $chart_versions versions" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Mirror Jobs**: $((image_versions + chart_versions))" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check job results
+          yaml_result="${{ needs.validate-yaml.result }}"
+          matrix_result="${{ needs.test-matrix-generation.result }}"
+          
+          echo "### ✅ Validation Results" >> $GITHUB_STEP_SUMMARY
+          if [ "$yaml_result" = "success" ]; then
+            echo "- YAML syntax & schema validation: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- YAML syntax & schema validation: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$matrix_result" = "success" ]; then
+            echo "- Matrix generation test: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Matrix generation test: ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$yaml_result" = "success" ] && [ "$matrix_result" = "success" ]; then
+            echo "🎉 **All validations passed!** Configuration is ready for mirroring." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Some validations failed.** Please review the errors above." >> $GITHUB_STEP_SUMMARY 
+          fi

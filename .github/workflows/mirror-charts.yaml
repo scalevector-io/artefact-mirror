@@ -1,6 +1,13 @@
 name: Mirror Helm Charts
 
 on:
+  # Depends on successful validation workflow completion
+  workflow_run:
+    workflows: ["Validate Configuration"]
+    types:
+      - completed
+    branches:
+      - main
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
     inputs:
@@ -12,70 +19,37 @@ on:
   schedule:
     - cron: '0 4 * * 1'
 
-  # New trigger: Runs on push to the main branch ONLY if the charts.yaml file changed
-  push:
-    branches:
-      - main
-    paths:
-      - 'configs/charts.yaml'
-
 jobs:
+  # Check if we should proceed based on validation success
+  check-validation:
+    name: Check Validation Status
+    runs-on: ubuntu-latest
+    # Only run this check if triggered by workflow_run
+    if: github.event_name == 'workflow_run'
+    outputs:
+      should_proceed: ${{ steps.check.outputs.should_proceed }}
+    steps:
+      - name: Check validation workflow result
+        id: check
+        run: |
+          if [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+            echo "✅ Validation workflow completed successfully, proceeding with chart mirroring"
+          else
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+            echo "❌ Validation workflow failed, skipping chart mirroring"
+          fi
+
   prepare-matrix:
     name: Prepare Matrix
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.generate_matrix.outputs.json_matrix }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install yq and jq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-          sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Generate matrix from YAML
-        id: generate_matrix
-        env:
-          TARGET_CHART: ${{ github.event.inputs.chart_name || '' }}
-        run: |
-          if [ -z "$TARGET_CHART" ]; then
-            # No specific chart targeted, include all charts
-            matrix=$(yq -o=json '[
-              .charts[]
-              | .versions[] as $v
-              | {
-                  "name": .name,
-                  "repo_name": .repo_name,
-                  "repo_url": .repo_url,
-                  "version": $v
-                }
-            ]' ./configs/charts.yaml | jq -c .)
-          else
-            # Specific chart targeted
-            matrix=$(yq -o=json --arg target "$TARGET_CHART" '[
-              .charts[]
-              | select(.name == $target)
-              | .versions[] as $v
-              | {
-                  "name": .name,
-                  "repo_name": .repo_name,
-                  "repo_url": .repo_url,
-                  "version": $v
-                }
-            ]' ./configs/charts.yaml | jq -c .)
-          fi
-          
-          # Write to GITHUB_OUTPUT using heredoc to handle special characters
-          {
-            echo "json_matrix<<EOF"
-            echo "$matrix"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
-          
-          echo "Generated matrix: $matrix"
+    # Skip validation check for manual runs and scheduled runs
+    needs: check-validation
+    if: always() && (github.event_name != 'workflow_run' || needs.check-validation.outputs.should_proceed == 'true')
+    uses: ./.github/workflows/generate-matrix.yml
+    with:
+      config-type: 'charts'
+      config-file: './configs/charts.yaml'
+      target-filter: ${{ github.event.inputs.chart_name || '' }}
 
   mirror:
     name: Mirror ${{ matrix.chart.name }}:${{ matrix.chart.version }}

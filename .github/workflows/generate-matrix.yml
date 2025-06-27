@@ -1,0 +1,158 @@
+name: Generate Matrix
+
+on:
+  workflow_call:
+    inputs:
+      config-type:
+        description: 'Type of configuration to process (images or charts)'
+        required: true
+        type: string
+      config-file:
+        description: 'Path to the configuration file'
+        required: true
+        type: string
+      target-filter:
+        description: 'Optional filter for specific artifact (e.g., specific image or chart name)'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      matrix:
+        description: 'Generated JSON matrix'
+        value: ${{ jobs.generate-matrix.outputs.matrix }}
+      count:
+        description: 'Number of matrix entries generated'
+        value: ${{ jobs.generate-matrix.outputs.count }}
+
+jobs:
+  generate-matrix:
+    name: Generate ${{ inputs.config-type }} Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate_matrix.outputs.json_matrix }}
+      count: ${{ steps.generate_matrix.outputs.count }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup tools
+        uses: ./.github/actions/setup-tools
+
+      - name: Generate matrix from YAML
+        id: generate_matrix
+        env:
+          CONFIG_TYPE: ${{ inputs.config-type }}
+          CONFIG_FILE: ${{ inputs.config-file }}
+          TARGET_FILTER: ${{ inputs.target-filter }}
+        run: |
+          echo "🔍 Generating matrix for $CONFIG_TYPE from $CONFIG_FILE"
+          
+          if [ "$CONFIG_TYPE" = "images" ]; then
+            # Generate images matrix
+            if [ -z "$TARGET_FILTER" ]; then
+              # No specific image targeted, include all images
+              matrix=$(yq -o=json '[
+                .images[]
+                | . as $img
+                | $img.versions[] as $v
+                | {
+                    "name": $img.name,
+                    "source_registry": $img.source_registry,
+                    "version": $v,
+                    "platforms": ($img.platforms // ["linux/amd64", "linux/arm64"])
+                  }
+              ]' "$CONFIG_FILE" | jq -c .)
+            else
+              # Specific image targeted
+              matrix=$(yq -o=json --arg target "$TARGET_FILTER" '[
+                .images[]
+                | select(.name == $target)
+                | . as $img
+                | $img.versions[] as $v
+                | {
+                    "name": $img.name,
+                    "source_registry": $img.source_registry,
+                    "version": $v,
+                    "platforms": ($img.platforms // ["linux/amd64", "linux/arm64"])
+                  }
+              ]' "$CONFIG_FILE" | jq -c .)
+            fi
+          elif [ "$CONFIG_TYPE" = "charts" ]; then
+            # Generate charts matrix
+            if [ -z "$TARGET_FILTER" ]; then
+              # No specific chart targeted, include all charts
+              matrix=$(yq -o=json '[
+                .charts[]
+                | .versions[] as $v
+                | {
+                    "name": .name,
+                    "repo_name": .repo_name,
+                    "repo_url": .repo_url,
+                    "version": $v
+                  }
+              ]' "$CONFIG_FILE" | jq -c .)
+            else
+              # Specific chart targeted
+              matrix=$(yq -o=json --arg target "$TARGET_FILTER" '[
+                .charts[]
+                | select(.name == $target)
+                | .versions[] as $v
+                | {
+                    "name": .name,
+                    "repo_name": .repo_name,
+                    "repo_url": .repo_url,
+                    "version": $v
+                  }
+              ]' "$CONFIG_FILE" | jq -c .)
+            fi
+          else
+            echo "❌ Invalid config type: $CONFIG_TYPE. Must be 'images' or 'charts'"
+            exit 1
+          fi
+          
+          # Validate matrix
+          if ! echo "$matrix" | jq . > /dev/null 2>&1; then
+            echo "❌ Generated matrix is not valid JSON"
+            exit 1
+          fi
+          
+          # Count matrix entries
+          count=$(echo "$matrix" | jq '. | length')
+          
+          # Write to GITHUB_OUTPUT using heredoc to handle special characters
+          {
+            echo "json_matrix<<EOF"
+            echo "$matrix"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "count=$count" >> $GITHUB_OUTPUT
+          
+          echo "✅ Generated matrix with $count entries for $CONFIG_TYPE"
+          if [ "$count" -gt 0 ]; then
+            echo "Generated matrix preview:"
+            echo "$matrix" | jq '.[0:3]'  # Show first 3 entries as preview
+            if [ "$count" -gt 3 ]; then
+              echo "... and $((count - 3)) more entries"
+            fi
+          fi
+
+      - name: Matrix validation
+        run: |
+          matrix="${{ steps.generate_matrix.outputs.json_matrix }}"
+          count="${{ steps.generate_matrix.outputs.count }}"
+          
+          echo "## 📊 Matrix Generation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration Type**: ${{ inputs.config-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configuration File**: ${{ inputs.config-file }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Filter**: ${{ inputs.target-filter || 'All artifacts' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Generated Entries**: $count" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$count" -eq 0 ]; then
+            echo "⚠️ **Warning**: No matrix entries generated. Check configuration and filters." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **Success**: Matrix generated successfully!" >> $GITHUB_STEP_SUMMARY
+          fi 
