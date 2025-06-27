@@ -16,10 +16,11 @@ This repository automatically mirrors container images and Helm charts to GitHub
 - 🛡️ **Security Scanning**: Automatically scans all mirrored container images for vulnerabilities with **Trivy** (non-blocking).
 - ✅ **Configuration Validation**: Validates all configuration files before any mirroring operations.
 - 🔄 **Automated Mirroring**: Weekly scheduled runs via GitHub Actions with dependency-based execution.
+- ⚡ **Intelligent Caching**: Docker layer caching and Trivy database caching for improved performance.
 - 📦 **Container Images**: Mirrors to GitHub Container Registry, with multi-platform support.
 - ⚙️ **Helm Charts**: Mirrors to GitHub Container Registry as OCI artifacts.
 - 📝 **Declarative Configuration**: All artifacts are defined in simple YAML files.
-- ⚡ **Error Isolation**: `fail-fast: false` ensures that the failure of a single artifact does not stop the entire workflow.
+- 🔧 **Error Isolation**: `fail-fast: false` ensures that the failure of a single artifact does not stop the entire workflow.
 
 ## How It Works
 
@@ -63,10 +64,11 @@ graph TD
 
 This architecture provides significant benefits over a sequential loop:
 - **Safety**: Configuration is validated before any mirroring attempts
-- **Speed**: All artifacts are mirrored concurrently
+- **Speed**: All artifacts are mirrored concurrently with intelligent caching
 - **Resilience**: A single failure won't halt other jobs
 - **Clarity**: The Actions UI provides a clear, individual status for every artifact
 - **Security**: Comprehensive vulnerability scanning with multiple reporting formats
+- **Efficiency**: Docker layer caching reduces bandwidth and improves performance
 
 ## Quick Start
 
@@ -184,6 +186,28 @@ Each mirrored container image is automatically scanned for vulnerabilities:
 - **Severity tracking**: Critical, High, and Medium vulnerabilities
 - **Multiple formats**: Text summaries for reading, JSON reports for automation
 - **Artifact Storage**: Both human-readable and machine-readable formats available as workflow artifacts (30-day retention)
+
+## Performance Optimizations
+
+The system includes several performance optimizations to reduce runtime and resource usage:
+
+### Intelligent Caching
+- **Docker Layer Caching**: Uses `actions/cache` to cache Docker layers between workflow runs
+- **Cache Key Strategy**: Unique cache keys per image name and version for optimal cache hit rates
+- **Trivy Database Caching**: Caches vulnerability database to avoid repeated downloads
+- **Cache Cleanup**: Automatic cleanup of unused Docker resources while preserving cache
+
+### Cache Benefits
+- **Reduced Build Times**: Subsequent runs of the same image versions are significantly faster
+- **Bandwidth Savings**: Cached layers reduce network transfer requirements  
+- **Resource Efficiency**: Less CPU and memory usage for repeated image operations
+- **Improved Reliability**: Reduced dependency on external registry availability
+
+### Cache Management
+- **Automatic Cache Keys**: Generated based on image name, version, and commit SHA
+- **Cache Fallbacks**: Multiple restore key patterns for maximum cache utilization
+- **Size Monitoring**: Built-in cache size reporting and cleanup procedures
+- **Retention**: Leverages GitHub Actions cache retention policies (7 days default)
 
 ## Contributing
 

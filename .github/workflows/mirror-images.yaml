@@ -76,6 +76,29 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1
+            network=host
+
+      - name: Generate cache key
+        id: cache_key
+        run: |
+          # Create a cache key based on image name and version
+          IMAGE_CACHE_KEY="${{ matrix.image.name }}-${{ matrix.image.version }}"
+          # Replace invalid characters for cache key
+          IMAGE_CACHE_KEY=$(echo "$IMAGE_CACHE_KEY" | sed 's/[\/:<>|*?"\\[:cntrl:]]/-/g')
+          echo "image_cache_key=${IMAGE_CACHE_KEY}" >> $GITHUB_OUTPUT
+          echo "📦 Cache key: ${IMAGE_CACHE_KEY}"
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-${{ steps.cache_key.outputs.image_cache_key }}-${{ github.sha }}
+          restore-keys: |
+            buildx-${{ steps.cache_key.outputs.image_cache_key }}-
+            buildx-
 
       - name: Define Image Names
         id: image_names
@@ -94,22 +117,34 @@ jobs:
           echo "--> Creating multi-platform manifest for ${DESTINATION_IMAGE}"
           echo "    Source: ${SOURCE_IMAGE}"
           echo "    Platforms: ${{ join(matrix.image.platforms, ', ') }}"
+          echo "    Cache key: ${{ steps.cache_key.outputs.image_cache_key }}"
           
-          # Build source references for each platform
-          SOURCE_REFS=""
-          for platform in ${{ join(matrix.image.platforms, ' ') }}; do
-            if [ -n "$SOURCE_REFS" ]; then
-              SOURCE_REFS="$SOURCE_REFS "
-            fi
-            SOURCE_REFS="${SOURCE_REFS}${SOURCE_IMAGE}"
-          done
+          # Configure buildx to use cache
+          docker buildx create --use --name cached-builder --driver docker-container --driver-opt network=host || true
           
-          # Use buildx imagetools to create multi-platform manifest
+          # Pull source image with caching
+          echo "--> Pulling source image with layer caching..."
+          docker buildx imagetools inspect ${SOURCE_IMAGE}
+          
+          # Use buildx imagetools to create multi-platform manifest with caching
           docker buildx imagetools create \
             --tag ${DESTINATION_IMAGE} \
             ${SOURCE_IMAGE}
           
           echo "--> Successfully created multi-platform image: ${DESTINATION_IMAGE}"
+          
+          # Export cache for future runs
+          echo "--> Exporting cache for future runs..."
+          docker buildx du --verbose || true
+
+      - name: Cache Trivy database
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ hashFiles('**/go.sum') }}-${{ github.run_number }}
+          restore-keys: |
+            trivy-db-${{ hashFiles('**/go.sum') }}-
+            trivy-db-
 
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@master
@@ -207,3 +242,24 @@ jobs:
             ${{ steps.artifact_name.outputs.report_file }}
             trivy-report.json
           retention-days: 30
+
+      - name: Cache cleanup and optimization
+        if: always()
+        run: |
+          echo "--> Cache cleanup and optimization"
+          
+          # Display cache usage information
+          echo "📊 Docker system disk usage:"
+          docker system df
+          
+          # Clean up unused Docker resources (but keep cache)
+          echo "🧹 Cleaning up unused Docker resources..."
+          docker system prune -f --volumes || true
+          
+          # Display buildx cache info
+          echo "📦 Buildx cache information:"
+          docker buildx du --verbose || true
+          
+          # Display final disk usage
+          echo "💾 Final disk usage:"
+          df -h
